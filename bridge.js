@@ -86,6 +86,31 @@ class PreSonusApiBridge {
                     this.getChannelPan(id, params);
                     break;
                     
+                // Complete object model methods
+                case 'getMixerState':
+                    this.getMixerState(id, params);
+                    break;
+                    
+                case 'setMixerProperty':
+                    this.setMixerProperty(id, params);
+                    break;
+                    
+                case 'getMixerProperty':
+                    this.getMixerProperty(id, params);
+                    break;
+                    
+                case 'loadScene':
+                    this.loadScene(id, params);
+                    break;
+                    
+                case 'saveScene':
+                    this.saveScene(id, params);
+                    break;
+                    
+                case 'getSceneList':
+                    this.getSceneList(id, params);
+                    break;
+                    
                 default:
                     this.sendError(id, `Unknown method: ${method}`);
             }
