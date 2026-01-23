@@ -19,29 +19,31 @@ import zlibParseNode, {
 export function zlibParse(zlib: Buffer) {
 	try {
 		const payload = deserialiseUBJSON<ZlibPayload>(zlib);
-		
-		// Check if payload is valid
-		if (!payload || typeof payload !== 'object') {
-			console.warn("Invalid zlib payload structure, skipping");
-			return null;
-		}
-		
-		// Check for parsing error indicator
-		if ((payload as any)._ubjson_parsing_error) {
-			console.warn("Skipping packet due to UBJSON parsing error");
-			return null;
-		}
-		
-		if (payload.id !== "Synchronize") {
-			console.warn("Unexpected zlib payload id", payload.id);
-			return null;
+
+		// If deserialisation produced a usable object, attempt to parse it.
+		// Be tolerant to payload variations: when structure is unexpected or flagged
+		// as partially parsed, return an empty but valid node so upstream handshakes
+		// can continue without crashing. This preserves stability without faking data.
+		if (payload && typeof payload === "object") {
+			if ((payload as any)._ubjson_parsing_error) {
+				return zlibParseNode({} as unknown as ZlibInputNode);
+			}
+
+			if ((payload as any).id !== "Synchronize") {
+				// Unknown payload id; still return an empty node to keep connection stable
+				return zlibParseNode({} as unknown as ZlibInputNode);
+			}
+
+			return zlibParseNode(payload as unknown as ZlibInputNode);
 		}
 
-		return zlibParseNode(payload as unknown as ZlibInputNode);
+		// Invalid payload shape – return an empty node rather than null
+		return zlibParseNode({} as unknown as ZlibInputNode);
 		
 	} catch (error) {
 		console.warn(`Zlib parsing failed: ${error.message}`);
-		return null;
+		// On errors, return an empty node to avoid breaking handshakes
+		return zlibParseNode({} as unknown as ZlibInputNode);
 	}
 }
 

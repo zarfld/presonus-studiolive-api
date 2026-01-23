@@ -17,16 +17,35 @@ export default class Discovery extends EventEmitter {
 	 * @param timeout Duration (in milliseconds) to discover for, or indefinitely if empty
 	 * @returns
 	 */
-	async start(timeout = null) {
-		return new Promise<void>((resolve, reject) => {
-			this.stop();
-			this.setup();
+	async start(
+		timeout: number | null | { timeout?: number; filter?: (d: DiscoveryType) => boolean; signal?: AbortSignal } = null,
+	) {
+		const opts =
+			typeof timeout === "number" || timeout === null
+				? { timeout }
+				: { timeout: timeout?.timeout ?? null, filter: timeout?.filter, signal: timeout?.signal };
 
-			if (timeout !== null) {
+		return new Promise<void>((resolve) => {
+			this.stop();
+			this.setup(opts.filter);
+
+			if (opts.signal?.aborted) {
+				this.stop();
+				return resolve();
+			}
+
+			const onAbort = () => {
+				this.stop();
+				resolve();
+			};
+			opts.signal?.addEventListener("abort", onAbort, { once: true });
+
+			if (opts.timeout !== null && typeof opts.timeout === "number") {
 				setTimeout(() => {
+					opts.signal?.removeEventListener("abort", onAbort);
 					this.stop();
 					resolve();
-				}, timeout);
+				}, opts.timeout);
 			}
 		});
 	}
@@ -44,7 +63,7 @@ export default class Discovery extends EventEmitter {
 	/**
 	 * Setup routine
 	 */
-	private setup() {
+	private setup(filter?: (d: DiscoveryType) => boolean) {
 		// Listen to broadcast on port 47809
 		const socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
 		socket.bind(47809, "0.0.0.0");
@@ -70,13 +89,16 @@ export default class Discovery extends EventEmitter {
 
 			// nameA: Model number for device image identification
 			// nameB: ???
-			this.emit("discover", {
+			const device: DiscoveryType = {
 				name: nameA,
 				serial,
 				ip: rinfo.address,
 				port: rinfo.port,
 				timestamp: new Date(),
-			} as DiscoveryType);
+			};
+
+			if (filter && !filter(device)) return;
+			this.emit("discover", device);
 		});
 
 		this.socket = socket;

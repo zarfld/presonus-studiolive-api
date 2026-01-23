@@ -60,4 +60,11 @@ export default class KeepAliveHelper {
 
 		this.updateTime();
 	}
+
+	stop() {
+		if (this.#loop) {
+			clearInterval(this.#loop);
+			this.#loop = null as any;
+		}
+	}
 }

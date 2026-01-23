@@ -45,13 +45,15 @@ type zlibNodeParserOptArgs = Partial<{
  * Parse deserialised zlib data into an object tree
  */
 export function zlibParseNode(node: ZlibInputNode, { base = {} }: zlibNodeParserOptArgs = {}): ZlibNode {
-	const root = { ...base } as ZlibNode;
+	const root = { [ZlibKeySymbol]: [], ...base } as ZlibNode;
+	const debugEnabled = process.env.DEBUG_PRESONUS === "1" || process.env.DEBUG_PRESONUS === "true";
 
 	function setMetadata(key, value, type: symbol) {
 		if (!Object.hasOwn(root, key)) {
-			console.warn(`[${root[ZlibKeySymbol].join("/")}/${key}] did not exist, creating`);
+			if (debugEnabled) console.warn(`[${(root[ZlibKeySymbol] ?? []).join("/")}/${key}] did not exist, creating`);
 		} else if (Object.hasOwn(root[key], type)) {
-			console.warn(`[${root[ZlibKeySymbol].join("/")}/${key}] already has metadata ${type.toString()} set, overriding`);
+			if (debugEnabled)
+				console.warn(`[${(root[ZlibKeySymbol] ?? []).join("/")}/${key}] already has metadata ${type.toString()} set, overriding`);
 		}
 		root[key] = { ...root[key], [type]: value };
 	}
@@ -74,7 +76,8 @@ export function zlibParseNode(node: ZlibInputNode, { base = {} }: zlibNodeParser
 		values(data) {
 			for (let [key, value] of Object.entries(data)) {
 				if (Object.hasOwn(root, key))
-					console.warn(`[${root[ZlibKeySymbol].join("/")}/${key}] already has value set, overriding`);
+					if (debugEnabled)
+						console.warn(`[${(root[ZlibKeySymbol] ?? []).join("/")}/${key}] already has value set, overriding`);
 
 				const symbolPath = [...(root?.[ZlibKeySymbol] ?? []), key];
 
@@ -108,7 +111,7 @@ export function zlibParseNode(node: ZlibInputNode, { base = {} }: zlibNodeParser
 		if (Object.hasOwn(keyHandlers, key)) {
 			keyHandlers[key]?.(data);
 		} else {
-			console.warn(`[${root[ZlibKeySymbol]?.join("/") ?? []}] unexpected child key ${key}`);
+			if (debugEnabled) console.warn(`[${(root[ZlibKeySymbol] ?? []).join("/")}] unexpected child key ${key}`);
 		}
 	}
 	// #endregion
@@ -117,11 +120,12 @@ export function zlibParseNode(node: ZlibInputNode, { base = {} }: zlibNodeParser
 	// have a value as keys are only added on child nodes and value methods
 	for (const [key, value] of Object.entries(root)) {
 		if (!Object.hasOwn(value as object, ZlibKeySymbol)) {
-			console.warn(`[${root[ZlibKeySymbol].join("/")}] finished building, but ${key} did not have a value`);
+			if (debugEnabled)
+				console.warn(`[${(root[ZlibKeySymbol] ?? []).join("/")}] finished building, but ${key} did not have a value`);
 		}
 
 		// Delete the key, as we've finished building
-		delete value[ZlibKeySymbol];
+		delete (value as any)[ZlibKeySymbol];
 	}
 
 	return root;

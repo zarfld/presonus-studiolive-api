@@ -133,7 +133,7 @@ export default function createServer(port, onData: (data: MeterData) => any) {
 		});
 
 		UDPserver.on("listening", () => {
-			console.log("Listening on port", UDPserver.address().port);
+			logger.info({ port: UDPserver.address().port }, "MeterServer listening");
 			resolve(UDPserver);
 		});
 		UDPserver.bind(port);
