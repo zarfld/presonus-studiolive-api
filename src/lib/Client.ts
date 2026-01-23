@@ -293,17 +293,47 @@ export class Client {
 					
 						// Add timeout for ZLIB - if parsing fails, don't block connection
 						zlibTimeoutHandle = setTimeout(() => {
-							logger.warn("ZLIB packet not received or parsing failed, continuing with empty state");
+							logger.warn("ZLIB packet not received or parsing failed, continuing with default channel counts");
+							
+							// Set default counts for StudioLive 32SC (Series III max structure)
+							const defaultChannelCounts: ChannelCount = {
+								LINE: 64,
+								AUX: 32,
+								FX: 8,
+								FXRETURN: 8,
+								RETURN: 4,
+								TALKBACK: 1,
+								MAIN: 1,
+								DCA: 6,
+								SUB: 6,
+								MASTER: 0,
+								MONO: 0,
+							};
+							this.channelCounts = defaultChannelCounts;
+							setCounts(defaultChannelCounts);
+							console.error("[DEBUG Client.ts] Set default counts:", JSON.stringify(defaultChannelCounts, null, 2));
+							
 							zlibResolved = true;
 							resolve(this);
 						}, 5000); // 5 second timeout for ZLIB
 					
 						this.once(MessageCode.ZLIB, () => {
-						clearTimeout(zlibTimeoutHandle);
-						// De-register the listener in case the payload was not encapsulated in a CK packet
-						this.removeListener(MessageCode.Chunk, chunkedZlibInitCallback);
+							clearTimeout(zlibTimeoutHandle);
+							// De-register the listener in case the payload was not encapsulated in a CK packet
+							this.removeListener(MessageCode.Chunk, chunkedZlibInitCallback);
 
-							const getCount = (key) => Object.keys(this.state.get(key) ?? {}).length;
+							// Count channels by checking if the nested object exists and has entries
+							// State structure is: this.state.get("line") returns an object like { "1": {...}, "2": {...}, ... }
+							const getCount = (key) => {
+								const channelObj = this.state.get(key);
+								if (!channelObj || typeof channelObj !== 'object') {
+									console.error(`[DEBUG getCount] ${key}: no object found, channelObj=`, channelObj);
+									return 0;
+								}
+								const count = Object.keys(channelObj).length;
+								console.error(`[DEBUG getCount] ${key}: ${count} channels`);
+								return count;
+							};
 							const channelCounts: ChannelCount = {
 								LINE: getCount("line"),
 								AUX: getCount("aux"),
@@ -328,8 +358,33 @@ export class Client {
 								 */
 								MONO: getCount("mono"),
 							};
-							this.channelCounts = channelCounts;
-							setCounts(channelCounts);
+							
+							console.error("[DEBUG ZLIB handler] Final channel counts:", JSON.stringify(channelCounts, null, 2));
+							
+							// If all counts are zero, the state hasn't been populated yet
+							// Use default counts for Series III max structure
+							const totalCounts = Object.values(channelCounts).reduce((sum, count) => sum + count, 0);
+							if (totalCounts === 0) {
+								console.error("[DEBUG ZLIB handler] State not populated, using default channel counts");
+								const defaultChannelCounts: ChannelCount = {
+									LINE: 64,
+									AUX: 32,
+									FX: 8,
+									FXRETURN: 8,
+									RETURN: 4,
+									TALKBACK: 1,
+									MAIN: 1,
+									DCA: 6,
+									SUB: 6,
+									MASTER: 0,
+									MONO: 0,
+								};
+								this.channelCounts = defaultChannelCounts;
+								setCounts(defaultChannelCounts);
+							} else {
+								this.channelCounts = channelCounts;
+								setCounts(channelCounts);
+							}
 							zlibResolved = true;
 							resolve(this);
 						});
