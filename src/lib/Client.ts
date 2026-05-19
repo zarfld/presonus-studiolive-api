@@ -31,12 +31,10 @@ import { JSONtoPacketBuffer } from "./util/jsonPacketUtil";
 // Forward discovery events
 const discovery = new Discovery();
 
-type APIEventMap = Omit<{ [_ in keyof typeof ConnectionState]: [] }, "error"> & {
+type APIEventMap = { [_ in keyof typeof ConnectionState]: [] } & {
 	[_ in MessageCode]: [any];
 } & {
 	meter: [MeterData];
-		error: [Error];
-		disconnected: [];
 	data: [
 		{
 			code: MessageCode;
@@ -63,8 +61,6 @@ export class Client {
 
 	private conn: ReturnType<typeof DataClient>;
 	private connectPromise: Promise<Client>;
-	private emittedDisconnected: boolean = false;
-	private emittedClosed: boolean = false;
 
 	constructor(address: InstanceOptions.ConnectionAddress, options?: Partial<InstanceOptions.InstanceOptions>) {
 		if (!address?.host) throw new Error("Host address not supplied");
@@ -182,39 +178,14 @@ export class Client {
 	/**
 	 * @param timeout Default 10s
 	 */
-	static async discover(
-		timeoutOrOptions: number | { timeout?: number; filter?: (d: DiscoveryType) => boolean; signal?: AbortSignal } =
-			10 * 1000,
-	) {
-		if (typeof timeoutOrOptions === "number") {
-			const devices: { [serial: string]: DiscoveryType } = {};
-			const func = (device) => {
-				devices[device.serial] = device;
-			};
-
-			discovery.on("discover", func);
-			await discovery.start(timeoutOrOptions);
-			discovery.off("discover", func);
-
-			return Object.values(devices);
-		}
-
-		return Client.discoverWithOptions(timeoutOrOptions);
-	}
-
-	static async discoverWithOptions({
-		timeout = 10 * 1000,
-		filter,
-		signal,
-	}: { timeout?: number; filter?: (d: DiscoveryType) => boolean; signal?: AbortSignal } = {}) {
+	static async discover(timeout = 10 * 1000) {
 		const devices: { [serial: string]: DiscoveryType } = {};
-		const func = (device: DiscoveryType) => {
-			if (filter && !filter(device)) return;
+		const func = (device) => {
 			devices[device.serial] = device;
 		};
 
 		discovery.on("discover", func);
-		await discovery.start({ timeout, filter, signal });
+		await discovery.start(timeout);
 		discovery.off("discover", func);
 
 		return Object.values(devices);
@@ -243,8 +214,6 @@ export class Client {
 
 		const connectPromise = new Promise<this>((resolve, reject) => {
 			let fastReconnectTimer: ReturnType<typeof setTimeout>;
-			let handshakeTimer: ReturnType<typeof setTimeout> | undefined;
-			const handshakeTimeoutMs = Number(process.env.PRESONUS_HANDSHAKE_TIMEOUT_MS || "10000");
 			logger.info({ host: this.serverHost, port: this.serverPort }, "Connecting to console");
 
 			const reconnect = () => {
@@ -266,74 +235,14 @@ export class Client {
 				};
 				this.addListener(MessageCode.Chunk, chunkedZlibInitCallback);
 
-				let zlibResolved = false;
-				let subResolved = false;
-			let zlibTimeoutHandle: NodeJS.Timeout;
-			const cleanupHandshake = () => {
-				if (handshakeTimer) clearTimeout(handshakeTimer);
-				if (zlibTimeoutHandle) clearTimeout(zlibTimeoutHandle);
-				this.removeListener(MessageCode.Chunk, chunkedZlibInitCallback);
-			};
-
-			handshakeTimer = setTimeout(() => {
-					try {
-						cleanupHandshake();
-						if (!this.conn.destroyed) this.conn.destroy();
-						logger.warn({ timeout: handshakeTimeoutMs }, "Handshake timed out");
-						this.emit("error", new Error("Handshake timeout"));
-						this.emit("disconnected");
-						this.emit("closed");
-					} catch {}
-					reject(new Error("Handshake timeout"));
-				}, handshakeTimeoutMs);
-
 				Promise.all([
 					new Promise((resolve) => {
 						// TODO: Do DCAs change during project/scene recall?
-					
-						// Add timeout for ZLIB - if parsing fails, don't block connection
-						zlibTimeoutHandle = setTimeout(() => {
-							logger.warn("ZLIB packet not received or parsing failed, continuing with default channel counts");
-							
-							// Set default counts for StudioLive 32SC (Series III max structure)
-							const defaultChannelCounts: ChannelCount = {
-								LINE: 64,
-								AUX: 32,
-								FX: 8,
-								FXRETURN: 8,
-								RETURN: 4,
-								TALKBACK: 1,
-								MAIN: 1,
-								DCA: 6,
-								SUB: 6,
-								MASTER: 0,
-								MONO: 0,
-							};
-							this.channelCounts = defaultChannelCounts;
-							setCounts(defaultChannelCounts);
-							console.error("[DEBUG Client.ts] Set default counts:", JSON.stringify(defaultChannelCounts, null, 2));
-							
-							zlibResolved = true;
-							resolve(this);
-						}, 5000); // 5 second timeout for ZLIB
-					
 						this.once(MessageCode.ZLIB, () => {
-							clearTimeout(zlibTimeoutHandle);
 							// De-register the listener in case the payload was not encapsulated in a CK packet
 							this.removeListener(MessageCode.Chunk, chunkedZlibInitCallback);
 
-							// Count channels by checking if the nested object exists and has entries
-							// State structure is: this.state.get("line") returns an object like { "1": {...}, "2": {...}, ... }
-							const getCount = (key) => {
-								const channelObj = this.state.get(key);
-								if (!channelObj || typeof channelObj !== 'object') {
-									console.error(`[DEBUG getCount] ${key}: no object found, channelObj=`, channelObj);
-									return 0;
-								}
-								const count = Object.keys(channelObj).length;
-								console.error(`[DEBUG getCount] ${key}: ${count} channels`);
-								return count;
-							};
+							const getCount = (key) => Object.keys(this.state.get(key) ?? {}).length;
 							const channelCounts: ChannelCount = {
 								LINE: getCount("line"),
 								AUX: getCount("aux"),
@@ -358,34 +267,8 @@ export class Client {
 								 */
 								MONO: getCount("mono"),
 							};
-							
-							console.error("[DEBUG ZLIB handler] Final channel counts:", JSON.stringify(channelCounts, null, 2));
-							
-							// If all counts are zero, the state hasn't been populated yet
-							// Use default counts for Series III max structure
-							const totalCounts = Object.values(channelCounts).reduce((sum, count) => sum + count, 0);
-							if (totalCounts === 0) {
-								console.error("[DEBUG ZLIB handler] State not populated, using default channel counts");
-								const defaultChannelCounts: ChannelCount = {
-									LINE: 64,
-									AUX: 32,
-									FX: 8,
-									FXRETURN: 8,
-									RETURN: 4,
-									TALKBACK: 1,
-									MAIN: 1,
-									DCA: 6,
-									SUB: 6,
-									MASTER: 0,
-									MONO: 0,
-								};
-								this.channelCounts = defaultChannelCounts;
-								setCounts(defaultChannelCounts);
-							} else {
-								this.channelCounts = channelCounts;
-								setCounts(channelCounts);
-							}
-							zlibResolved = true;
+							this.channelCounts = channelCounts;
+							setCounts(channelCounts);
 							resolve(this);
 						});
 					}),
@@ -397,14 +280,12 @@ export class Client {
 						const subscribeCallback = (data) => {
 							if (data.id === "SubscriptionReply") {
 								this.removeListener(MessageCode.JSON, subscribeCallback);
-								subResolved = true;
 								resolve(this);
 							}
 						};
 						this.addListener(MessageCode.JSON, subscribeCallback);
 					}),
 				]).then(() => {
-					cleanupHandshake();
 					this.keepAliveHelper.start(
 						(packets) => {
 							packets.forEach((bytes) => this._writeBytes(bytes));
@@ -412,17 +293,10 @@ export class Client {
 						() => {
 							if (!this.conn.destroyed) this.conn.destroy();
 							logger.info("Connection closed");
-							if (!this.emittedDisconnected) {
-								this.emittedDisconnected = true;
-								this.emit("disconnected");
-							}
-							if (!this.emittedClosed) {
-								this.emittedClosed = true;
-								this.emit("closed");
-							}
+							this.emit("closed");
 
+							console.log("conn was closed so will reconnect");
 							if (this.options?.autoreconnect) {
-								logger.info("Connection closed; attempting autoreconnect");
 								this.emit("reconnecting");
 								reconnect();
 							}
@@ -443,15 +317,7 @@ export class Client {
 				this.conn.destroy();
 				fastReconnectTimer = setTimeout(() => reconnect(), 2000);
 				this.conn.connect(this.serverPort, this.serverHost);
-				this.conn.once("error", (err) => {
-								try {
-									this.emit("error", err instanceof Error ? err : new Error(String(err)));
-									if (!this.emittedDisconnected) {
-										this.emittedDisconnected = true;
-										this.emit("disconnected");
-									}
-								} catch {}
-							});
+				this.conn.once("error", () => {});
 			};
 
 			doConnect();
@@ -462,40 +328,16 @@ export class Client {
 
 	async close() {
 		this.meterUnsubscribe();
-		try {
-			await this._sendPacket(MessageCode.JSON, unsubscribePacket);
-		} catch {}
-		try {
-			this.keepAliveHelper?.stop?.();
-		} finally {
+		await this._sendPacket(MessageCode.JSON, unsubscribePacket).then(() => {
 			this.conn.destroy();
-			// Ensure lifecycle events are emitted on manual close
-			queueMicrotask?.(() => {
-				if (!this.emittedDisconnected) {
-					this.emittedDisconnected = true;
-					this.emit("disconnected");
-				}
-				if (!this.emittedClosed) {
-					this.emittedClosed = true;
-					this.emit("closed");
-				}
-			});
-		}
+		});
 	}
 
 	/**
 	 * Analyse, decode and emit packets
 	 */
 	private handleRecvPacket(packet) {
-		let messageCode: MessageCode | null = null;
-		let data: any = null;
-		try {
-			[messageCode, data] = analysePacket(packet);
-			if (messageCode === null) return;
-		} catch (err) {
-			this.emit("error", err instanceof Error ? err : new Error(String(err)));
-			return;
-		}
+		let [messageCode, data] = analysePacket(packet);
 		if (messageCode === null) return;
 
 		// Handle message types
@@ -514,12 +356,7 @@ export class Client {
 		};
 
 		if (Object.hasOwn(handlers, messageCode)) {
-			try {
-				data = handlers[messageCode]?.call?.(this, data);
-			} catch (err) {
-				this.emit("error", err instanceof Error ? err : new Error(String(err)));
-				return;
-			}
+			data = handlers[messageCode]?.call?.(this, data);
 		} else {
 			console.warn("Unhandled message code", messageCode);
 		}
@@ -865,36 +702,6 @@ export class Client {
 	}
 
 	/**
-	 * Get current pan (or width) value for a channel or AUX mix.
-	 * Returns 0..100 where applicable; null if unavailable.
-	 */
-	getPan(selector: ChannelSelector) {
-		let channelString = parseChannelString(selector);
-		const isStereo = this.state.get(channelString + "/link");
-
-		if (selector.mixType) {
-			switch (selector.mixType) {
-				case "AUX": {
-					const odd = (selector.mixNumber - 1) | 1;
-					channelString += `/aux${odd}${odd + 1}_`;
-					if (this.state.get(`aux.ch${selector.mixNumber}.link`)) {
-						channelString += isStereo ? "stpan" : "pan";
-					} else {
-						return null;
-					}
-					break;
-				}
-				default:
-					throw new Error("Unexpected mix type");
-			}
-		} else {
-			channelString += "/" + (isStereo ? "stereopan" : "pan");
-		}
-
-		return this.state.get(channelString);
-	}
-
-	/**
 	 * @internal By original nature, only an odd numbered channel is targeted (& ~1)
 	 */
 	setLink(selector: ChannelSelector, link: boolean) {
@@ -933,13 +740,7 @@ export class Client {
 	 * @internal Send a level command to the target
 	 * targetLevel - [0, 100]
 	 */
-	private _setLevel(
-		this: Client,
-		selector: ChannelSelector,
-		targetLevel,
-		duration = 0,
-		options?: { signal?: AbortSignal },
-	): Promise<null> {
+	private _setLevel(this: Client, selector: ChannelSelector, targetLevel, duration = 0): Promise<null> {
 		const targetString = this._getLevelString(selector);
 
 		const assertReturn = () => {
@@ -953,12 +754,7 @@ export class Client {
 			});
 		};
 
-		let canceled = false;
-		const abortListener = () => (canceled = true);
-		options?.signal?.addEventListener("abort", abortListener, { once: true });
-
 		const set = (level) => {
-			if (canceled) return;
 			this._sendPacket(
 				MessageCode.ParamValue,
 				Buffer.concat([Buffer.from(`${targetString}\x00\x00\x00`), toFloat(level / 100)]),
@@ -967,7 +763,6 @@ export class Client {
 
 		if (!duration) {
 			set(targetLevel);
-			options?.signal?.removeEventListener("abort", abortListener);
 			return assertReturn();
 		}
 
@@ -985,15 +780,7 @@ export class Client {
 				duration,
 				(v) => set(v),
 				async () => {
-					try {
-						if (!canceled) {
-							resolve(await assertReturn());
-						} else {
-							resolve(null);
-						}
-					} finally {
-						options?.signal?.removeEventListener("abort", abortListener);
-					}
+					resolve(await assertReturn());
 				},
 			);
 		});
@@ -1005,37 +792,21 @@ export class Client {
 	 * @param channel
 	 * @param level range: -84 dB to 10 dB
 	 */
-	async setChannelVolumeLogarithmic(
-		selector: ChannelSelector,
-		decibel: number,
-		duration?: number,
-		options?: { signal?: AbortSignal },
-	) {
-		return this._setLevel(selector, logVolumeToLinear(decibel), duration, options);
+	async setChannelVolumeLogarithmic(selector: ChannelSelector, decibel: number, duration?: number) {
+		return this._setLevel(selector, logVolumeToLinear(decibel), duration);
 	}
 
 	/**
-						if (!this.emittedDisconnected) {
-							this.emittedDisconnected = true;
-							this.emit("disconnected");
-						}
-						if (!this.emittedClosed) {
-							this.emittedClosed = true;
-							this.emit("closed");
-						}
+	 * Set volume (pseudo intensity)
+	 *
 	 * @description Sound is difficult, so this function attempts to provide a "what-you-see-is-what-you-get" interface to control the volume levels.
 	 *              `100` Sets the fader to the top (aka +10 dB)
 	 *              `72` Sets the fader to unity (aka 0 dB) or a value close enough
 	 *              `0` Sets the fader to the bottom (aka -84 dB)
 	 * @see http://www.sengpielaudio.com/calculator-levelchange.htm
 	 */
-	async setChannelVolumeLinear(
-		selector: ChannelSelector,
-		linearLevel: number,
-		duration?: number,
-		options?: { signal?: AbortSignal },
-	) {
-		return this._setLevel(selector, linearLevel, duration, options);
+	async setChannelVolumeLinear(selector: ChannelSelector, linearLevel: number, duration?: number) {
+		return this._setLevel(selector, linearLevel, duration);
 	}
 
 	/**

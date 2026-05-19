@@ -3,7 +3,76 @@
 // Communicates with C# wrapper via stdio JSON-RPC
 
 const { Client, Discovery } = require('./dist/cjs/api.js');
+const { getZlibValue } = require('./dist/cjs/lib/util/zlib/zlibUtil.js');
 const domain = require('domain');
+const fs = require('fs');
+const path = require('path');
+
+// Import ZlibValueSymbol to extract values from ZlibNode objects
+const { ZlibValueSymbol } = require('./dist/cjs/lib/util/zlib/zlibNodeParser.js');
+
+// Single debug log file
+const DEBUG_LOG = path.join(process.cwd(), 'debug-output.log');
+
+// Initialize log file
+try {
+    fs.writeFileSync(DEBUG_LOG, `=== Bridge Debug Log Started: ${new Date().toISOString()} ===\n`);
+} catch (err) {
+    console.error(`Failed to initialize log file: ${err.message}`);
+}
+
+// Debug logging function - writes to file instead of console.error
+function debugLog(...args) {
+    const timestamp = new Date().toISOString();
+    const message = args.map(arg => 
+        typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
+    ).join(' ');
+    
+    try {
+        fs.appendFileSync(DEBUG_LOG, `[${timestamp}] ${message}\n`);
+    } catch (err) {
+        // Fallback to console if file write fails
+        console.error(`[${timestamp}] ${message}`);
+    }
+}
+
+// Helper to extract value from ZlibNode (which stores values in Symbol properties)
+function extractZlibNodeValue(node) {
+    if (!node || typeof node !== 'object') return node;
+    
+    // Check if this is a ZlibNode with a Symbol value
+    const symbols = Object.getOwnPropertySymbols(node);
+    const valueSymbol = symbols.find(s => s.toString() === 'Symbol(value)');
+    
+    if (valueSymbol && node[valueSymbol] !== undefined) {
+        return node[valueSymbol];
+    }
+    
+    return node;
+}
+
+// Map channel type and number to actual ZLIB structure
+// PreSonus ZLIB structure (as discovered from actual mixer data):
+// - Line channels: ch4-ch32 at root level (ch1-ch3 got redirected to fxreturn during parse)
+// - Other types: aux.ch1, return.ch1, etc.
+function mapChannelPath(channelType, channelNumber, property) {
+    // Direct property access - no mapping
+    // C# API has separate functions for 'name' vs 'username'
+    const zlibProperty = property;
+    
+    if (channelType === 'line') {
+        // Line channels: ch1-ch9 are in line.ch1 container, ch10-32 at root level
+        // Try both locations
+        return { 
+            path: `ch${channelNumber}/${zlibProperty}`, 
+            channelKey: `ch${channelNumber}`,
+            fallbackPath: `line/ch${channelNumber}/${zlibProperty}`
+        };
+    }
+    
+    // Other types use nested structure: aux.ch1, return.ch1, etc.
+    return { path: `${channelType}/ch${channelNumber}/${zlibProperty}`, channelKey: `ch${channelNumber}` };
+}
 
 class PreSonusApiBridge {
     constructor() {
@@ -111,6 +180,10 @@ class PreSonusApiBridge {
                     this.getSceneList(id, params);
                     break;
                     
+                case 'getChannelCount':
+                    this.getChannelCount(id, params);
+                    break;
+                    
                 default:
                     this.sendError(id, `Unknown method: ${method}`);
             }
@@ -180,12 +253,87 @@ class PreSonusApiBridge {
             
             // Run client creation within the domain
             clientDomain.run(() => {
+                console.error(`[DEBUG createClient] Creating client for ${host}:${port}`);
+                
                 const client = new Client({ host, port }, {
                     autoreconnect: false,
-                    logLevel: 'error', // Use 'error' instead of 'silent' 
-                    timeout: 5000, // Shorter timeout to avoid hanging on bad data
-                    receiveTimeout: 5000, // Timeout for data reception
+                    logLevel: 'info', // Change to 'info' to see connection details
                     ...options
+                });
+                
+                console.error(`[DEBUG createClient] Client instance created`);
+                
+                // Add debug listener specifically for ZB (ZLIB) event to inspect structure
+                client.on('ZB', (zlibData) => {
+                    console.error(`[DEBUG ZB Event] Received ZLIB data`);
+                    console.error(`[DEBUG ZB Event] zlibData type:`, typeof zlibData);
+                    console.error(`[DEBUG ZB Event] zlibData is null?`, zlibData === null);
+                    console.error(`[DEBUG ZB Event] zlibData is undefined?`, zlibData === undefined);
+                    
+                    // SAVE ACTUAL ZLIB JSON TO FILE
+                    if (zlibData && typeof zlibData === 'object') {
+                        try {
+                            const fs = require('fs');
+                            const path = require('path');
+                            const outputPath = path.join(process.cwd(), 'zlib-structure.json');
+                            
+                            // Use custom replacer to handle Symbol values and circular references
+                            const seen = new WeakSet();
+                            const replacer = (key, value) => {
+                                if (value && typeof value === 'object') {
+                                    if (seen.has(value)) {
+                                        return '[Circular]';
+                                    }
+                                    seen.add(value);
+                                    
+                                    // Check if it has Symbol properties (ZlibNode)
+                                    const symbols = Object.getOwnPropertySymbols(value);
+                                    if (symbols.length > 0) {
+                                        const symbolValues = {};
+                                        symbols.forEach(sym => {
+                                            symbolValues[sym.toString()] = value[sym];
+                                        });
+                                        return { ...value, __symbolValue: symbolValues[symbols[0].toString()] };
+                                    }
+                                }
+                                return value;
+                            };
+                            
+                            fs.writeFileSync(outputPath, JSON.stringify(zlibData, replacer, 2));
+                            console.error(`[DEBUG] ✅ ZLIB structure saved to: ${outputPath}`);
+                        } catch (err) {
+                            console.error(`[DEBUG] ❌ Failed to save ZLIB structure: ${err.message}`);
+                        }
+                        
+                        // Log structure as-is, NO reorganization
+                        const keys = Object.keys(zlibData);
+                        console.error(`[DEBUG ZB Event] Top-level keys (first 20):`, keys.slice(0, 20).join(', '));
+                        console.error(`[DEBUG ZB Event] Total keys:`, keys.length);
+                        
+                        // Check for expected mixer sections
+                        const expectedSections = ['line', 'aux', 'main', 'fx', 'sub', 'dca'];
+                        const foundSections = expectedSections.filter(s => zlibData[s] !== undefined);
+                        console.error(`[DEBUG ZB Event] Found mixer sections:`, foundSections.join(', '));
+                        
+                        if (foundSections.length === 0) {
+                            console.error(`[DEBUG ZB Event] ⚠️  WARNING: No expected mixer sections found!`);
+                            console.error(`[DEBUG ZB Event] This might be a channel object instead of root`);
+                        }
+                        
+                        // If we have 'line', check its structure
+                        if (zlibData.line) {
+                            const lineKeys = Object.keys(zlibData.line).slice(0, 10);
+                            console.error(`[DEBUG ZB Event] line has keys:`, lineKeys.join(', '));
+                        }
+                    }
+                });
+                
+                // Add debug listeners for other events
+                const events = ['connect', 'connected', 'disconnected', 'closed', 'error'];
+                events.forEach(event => {
+                    client.on(event, (...args) => {
+                        console.error(`[DEBUG Client Event] ${event}:`, args.length > 0 ? (typeof args[0] === 'object' ? JSON.stringify(args[0]).substring(0, 100) : args[0]) : '(no args)');
+                    });
                 });
                 
                 // Set up event forwarding
@@ -209,12 +357,15 @@ class PreSonusApiBridge {
                 client._domain = clientDomain;
                 this.clients.set(clientId, client);
                 
+                console.error(`[DEBUG createClient] Client stored, ready to connect`);
+                
                 this.sendResponse(requestId, { 
                     type: 'client.created', 
                     clientId 
                 });
             });
         } catch (error) {
+            console.error(`[DEBUG createClient] Exception:`, error.message, error.stack);
             this.sendError(requestId, `Client creation failed: ${error.message}`);
         }
     }
@@ -226,26 +377,30 @@ class PreSonusApiBridge {
                 throw new Error(`Client ${clientId} not found`);
             }
             
-            // Run connect operation within the client's domain
-            const connectPromise = client._domain ? 
-                client._domain.bind(async () => {
-                    return await client.connect({
-                        clientDescription: 'PreSonus C# Wrapper Bridge',
-                        ...subscriptionOptions
-                    });
-                })() :
-                client.connect({
-                    clientDescription: 'PreSonus C# Wrapper Bridge',
-                    ...subscriptionOptions
-                });
+            console.error(`[DEBUG] Connecting client ${clientId}...`);
+            console.error(`[DEBUG] Client has domain:`, !!client._domain);
             
-            await connectPromise;
+            // Connect - just call it directly, the client handles its own domain
+            await client.connect({
+                clientDescription: 'PreSonus C# Wrapper Bridge',
+                ...subscriptionOptions
+            });
+            
+            console.error(`[DEBUG] Client connected successfully!`);
+            
+            // Give a moment for ZLIB to arrive
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            console.error(`[DEBUG] After 2s wait - client.zlibData has:`, 
+                client.zlibData ? Object.keys(client.zlibData).slice(0, 20).join(', ') : 'nothing');
             
             this.sendResponse(requestId, { 
                 type: 'client.connected', 
                 clientId 
             });
         } catch (error) {
+            console.error(`[DEBUG] Connect error:`, error.message);
+            console.error(`[DEBUG] Error stack:`, error.stack);
             this.sendError(requestId, `Client connect failed: ${error.message}`);
         }
     }
@@ -323,6 +478,47 @@ class PreSonusApiBridge {
         }
     }
     
+    getChannelCount(requestId, { clientId, channelType }) {
+        try {
+            const client = this.clients.get(clientId);
+            if (!client) {
+                throw new Error(`Client ${clientId} not found`);
+            }
+            
+            // Map channel type names to channelCounts keys
+            const typeMap = {
+                'line': 'LINE',
+                'aux': 'AUX',
+                'fx': 'FX',
+                'fxbus': 'FX',
+                'fxreturn': 'FXRETURN',
+                'return': 'RETURN',
+                'talkback': 'TALKBACK',
+                'main': 'MAIN',
+                'dca': 'DCA',
+                'sub': 'SUB',
+                'master': 'MASTER',
+                'mono': 'MONO'
+            };
+            
+            const countKey = typeMap[channelType.toLowerCase()];
+            if (!countKey) {
+                throw new Error(`Unknown channel type: ${channelType}`);
+            }
+            
+            const count = client.channelCounts ? client.channelCounts[countKey] : 0;
+            
+            this.sendResponse(requestId, {
+                type: 'channelCount',
+                clientId,
+                channelType,
+                count: count || 0
+            });
+        } catch (error) {
+            this.sendError(requestId, `Get channel count failed: ${error.message}`);
+        }
+    }
+    
     async setChannelVolume(requestId, { clientId, selector, level, duration }) {
         try {
             const client = this.clients.get(clientId);
@@ -352,19 +548,18 @@ class PreSonusApiBridge {
                 throw new Error(`Client ${clientId} not found`);
             }
             
-            // Create property path based on scene file structure
-            // e.g., "line.ch1.mute", "line.ch2.volume", "line.ch3.pan"
-            const propertyPath = `${channelType}.ch${channelNumber}.${property}`;
+            // Create property path based on mixer state structure
+            // e.g., "line/ch1/mute", "line/ch2/volume", "aux/ch3/pan"
+            const propertyPath = `${channelType}/ch${channelNumber}/${property}`;
             console.log(`🎛️  Setting ${propertyPath} = ${value}`);
             
-            // Use the working client infrastructure to set the property
-            // This leverages our successful UBJSON parsing 
+            // Use the client's state cache to set the property
             if (client._domain) {
                 client._domain.run(() => {
-                    client.setPropertyValue(propertyPath, value);
+                    client.state.set(propertyPath, value);
                 });
             } else {
-                client.setPropertyValue(propertyPath, value);
+                client.state.set(propertyPath, value);
             }
             
             this.sendResponse(requestId, { 
@@ -389,33 +584,105 @@ class PreSonusApiBridge {
                 throw new Error(`Client ${clientId} not found`);
             }
             
-            // Create property path based on scene file structure
-            const propertyPath = `${channelType}.ch${channelNumber}.${property}`;
-            console.log(`📊 Getting ${propertyPath}`);
+            // Map channel path correctly for 32SC mixer structure
+            const { path: zlibPath, channelKey, parentPath } = mapChannelPath(channelType, channelNumber, property);
             
-            let value;
+            let value = null;
             
-            // Use the working client infrastructure to get the property
-            // This leverages our successful UBJSON parsing
-            if (client._domain) {
-                client._domain.run(() => {
-                    value = client.getPropertyValue(propertyPath);
-                });
-            } else {
-                value = client.getPropertyValue(propertyPath);
+            // For line channels, try direct ZLIB access
+            if (client.zlibData && channelType === 'line') {
+                try {
+                    // Debug: Check what's actually in zlibData for ch1-9
+                    if (channelNumber >= 1 && channelNumber <= 9) {
+                        console.error(`[DEBUG] zlibData keys: ${Object.keys(client.zlibData).slice(0, 20).join(', ')}`);
+                        if (client.zlibData.line) {
+                            console.error(`[DEBUG] zlibData.line type: ${typeof client.zlibData.line}`);
+                            console.error(`[DEBUG] zlibData.line keys: ${Object.keys(client.zlibData.line).slice(0, 20).join(', ')}`);
+                            if (client.zlibData.line.children) {
+                                console.error(`[DEBUG] zlibData.line.children keys: ${Object.keys(client.zlibData.line.children).slice(0, 20).join(', ')}`);
+                            }
+                        }
+                    }
+                    
+                    // Ch10-32 are at root: client.zlibData.ch10, .ch11, etc.
+                    // Ch1-9 are nested: client.zlibData.line.ch1, .ch2, etc.
+                    let channelContainer = client.zlibData[channelKey];
+                    
+                    // If not found at root, try line container for ch1-9
+                    if (!channelContainer && channelNumber >= 1 && channelNumber <= 9) {
+                        const lineContainer = client.zlibData.line;
+                        if (lineContainer && lineContainer.children) {
+                            channelContainer = lineContainer.children[channelKey];
+                            console.error(`[DEBUG] Trying line container for ${channelKey}`);
+                        } else if (lineContainer) {
+                            // Maybe line IS the container and ch1 is directly on it
+                            channelContainer = lineContainer[channelKey];
+                            console.error(`[DEBUG] Trying direct line.${channelKey}`);
+                        }
+                    }
+                    
+                    if (channelContainer) {
+                        // Real channel data is in .children section
+                        const channel = channelContainer.children || channelContainer;
+                        
+                        // Direct property access - no mapping
+                        const zlibProperty = property;
+                        
+                        // Get property (it's a ZlibNode object)
+                        const propertyNode = channel[zlibProperty];
+                        if (propertyNode !== undefined) {
+                            // Extract value from ZlibNode Symbol
+                            value = extractZlibNodeValue(propertyNode);
+                            console.error(`[DEBUG] Got ${channelKey}.${zlibProperty} = ${JSON.stringify(value)}`);
+                        } else {
+                            console.error(`[DEBUG] ${channelKey} exists but ${zlibProperty} property not found`);
+                        }
+                    } else {
+                        console.error(`[DEBUG] ${channelKey} not found in ZLIB - will try state.get() fallback`);
+                    }
+                } catch (err) {
+                    console.error(`[DEBUG] Error accessing ZLIB: ${err.message}`);
+                }
             }
             
-            this.sendResponse(requestId, { 
+            // Fallback: Try state cache (populated by ParamValue updates)
+            // Changed: Allow state.get() fallback for ALL channels, not just 1-9
+            if (value === null && channelNumber >= 1) {
+                console.error(`[DEBUG] Channel ${channelNumber} not in ZLIB, trying state.get() fallback...`);
+                
+                // Direct property access - no mapping needed
+                const stateProperty = property;
+                
+                // For all channels, try direct state query
+                const statePath = `${channelType}/ch${channelNumber}/${stateProperty}`;
+                console.error(`[DEBUG] State path: ${statePath}`);
+                
+                if (client._domain) {
+                    client._domain.run(() => {
+                        value = client.state.get(statePath);
+                    });
+                } else {
+                    value = client.state.get(statePath);
+                }
+                
+                console.error(`[DEBUG] State.get() returned: ${JSON.stringify(value)}`);
+            }
+            
+            // Debug: Log the actual response being sent
+            const response = { 
                 type: 'mixer.property.get', 
                 clientId, 
                 channelType,
                 channelNumber,
                 property,
                 value,
-                path: propertyPath
-            });
+                path: zlibPath
+            };
+            console.error(`[DEBUG Response] Sending: ${JSON.stringify(response)}`);
+            this.sendResponse(requestId, response);
             
         } catch (error) {
+            console.error(`[ERROR getChannelProperty]`, error);
             this.sendError(requestId, `Get channel property failed: ${error.message}`);
         }
     }

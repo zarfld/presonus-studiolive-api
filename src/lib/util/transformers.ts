@@ -110,7 +110,7 @@ const transformers: {
 				buffer.reverse();
 			} else {
 				if (data === 0) return null;
-				buffer.writeInt32LE(data);
+				buffer.writeUInt32LE(data); // Use unsigned for color values that can exceed signed 32-bit max
 			}
 
 			return buffer.slice(0, 4).toString("hex");

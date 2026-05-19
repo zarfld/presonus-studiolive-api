@@ -4,7 +4,7 @@ import { SCENES_OF } from './src/lib/util/fileRequestUtil'
 import { createPacket } from './src/lib/util/messageProtocol'
 
 const client = new Client({
-  host: '192.168.0.29',
+  host: '157.247.1.112',
   port: 53000
 }, {
   autoreconnect: true,
